@@ -11,6 +11,8 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use system_tray::item::IconPixmap;
+use tracing::debug;
+use crate::lock;
 
 pub fn get_image(
     item: &TrayMenu,
@@ -29,6 +31,23 @@ pub fn get_image(
 /// Attempts to get a GTK `Image` component
 /// for the status notifier item's icon.
 fn get_image_from_icon_name(item: &TrayMenu, size: u32, icon_theme: &IconTheme) -> Result<Image> {
+
+    // let paintable = if let Some(pixbuf) = lock!(self.cache).paintable_cache.get(&image_ref) {
+    //     pixbuf.clone()
+    // } else {
+    //     let pixbuf =
+    //         Self::get_paintable(&image_ref, picture.scale_factor(), use_fallback).await?;
+    //
+    //     debug!("Loaded paintable: {:?}", pixbuf.is_some());
+    //
+    //     lock!(self.cache)
+    //         .paintable_cache
+    //         .insert(image_ref, pixbuf.clone());
+    //
+    //     pixbuf
+    // };
+
+
     if let Some(path) = item.icon_theme_path.as_ref()
         && !path.is_empty()
         && !get_icon_theme_search_paths(icon_theme).contains(path)

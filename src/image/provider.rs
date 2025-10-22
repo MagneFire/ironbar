@@ -35,7 +35,7 @@ enum ImageLocation {
     Icon(String),
     Local(PathBuf),
     Steam(String),
-    #[cfg(feature = "http")]
+    // #[cfg(feature = "http")]
     Remote(reqwest::Url),
 }
 
@@ -99,6 +99,8 @@ impl Provider {
         } else {
             let pixbuf =
                 Self::get_paintable(&image_ref, picture.scale_factor(), use_fallback).await?;
+
+                debug!("Loaded paintable: {:?}", pixbuf.is_some());
 
             lock!(self.cache)
                 .paintable_cache
@@ -182,7 +184,7 @@ impl Provider {
             Some(_t @ "file") => Some(ImageLocation::Local(PathBuf::from(
                 input_name[2..].to_string(),
             ))),
-            #[cfg(feature = "http")]
+            // #[cfg(feature = "http")]
             Some(_t @ ("http" | "https")) => input_name.parse().ok().map(ImageLocation::Remote),
             None if input_name.starts_with("steam_app_") => Some(ImageLocation::Steam(
                 input_name.chars().skip("steam_app_".len()).collect(),
@@ -222,6 +224,9 @@ impl Provider {
             None => None,
         };
 
+        debug!("resolve_location location {input}: {:?}", location);
+        debug!("resolve_location input_type {input}: {:?}", input_type);
+
         Ok(location)
     }
 
@@ -238,6 +243,7 @@ impl Provider {
 
         let buf = match &image_ref.location {
             Some(ImageLocation::Icon(name)) => {
+                debug!("ICON");
                 Ok(Some(
                     image_ref
                         .theme
@@ -253,6 +259,7 @@ impl Provider {
                 ))
             }
             Some(ImageLocation::Local(path)) if path.extension().unwrap_or_default() == "svg" => {
+                debug!("LOCAL SVG");
                 let scaled_size = image_ref.size * scale;
 
                 let pixbuf = Pixbuf::from_file_at_scale(path, scaled_size, scaled_size, true)?;
@@ -266,6 +273,7 @@ impl Provider {
             Some(ImageLocation::Local(path)) => Texture::from_filename(path)
                 .map(|t| t.scale(image_ref.size as f64, image_ref.size as f64)),
             Some(ImageLocation::Steam(app_id)) => {
+                debug!("STREAM");
                 const SIZES: [i32; 8] = [16, 24, 32, 48, 64, 96, 128, 256];
                 let size = SIZES
                     .into_iter()
@@ -284,9 +292,34 @@ impl Provider {
                 Texture::from_filename(path)
                     .map(|t| t.scale(image_ref.size as f64, image_ref.size as f64))
             }
-            #[cfg(feature = "http")]
+            // #[cfg(feature = "http")]
+
+        // Some(ImageLocation::Remote(uri)) => {
+        //     let client = reqwest::Client::new();
+        //     let res = client
+        //         .get(uri.clone())
+        //         .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36")
+        //         .send()
+        //         .await?;
+
+        //     if !res.status().is_success() {
+        //         return Err(Report::msg(format!("HTTP error: {}", res.status())));
+        //     }
+
+        //     let bytes = res.bytes().await?;
+        //     let bytes = Bytes::from_owned(bytes);
+        //     let texture = Texture::from_bytes(&bytes)?;
+        //     Ok(Some(texture.scale(image_ref.size as f64, image_ref.size as f64)))
+        // }
             Some(ImageLocation::Remote(uri)) => {
-                let res = reqwest::get(uri.clone()).await?;
+                debug!("REMOTE");
+                let client = reqwest::Client::new();
+                let res = client
+                    .get(uri.clone())
+                    .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0 Safari/537.36")
+                    .send()
+                    .await?;
+                // let res = reqwest::get(uri.clone()).await?;
 
                 let status = res.status();
                 let bytes = if status.is_success() {

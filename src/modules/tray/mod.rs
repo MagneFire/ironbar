@@ -5,10 +5,10 @@ use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
 use crate::clients::tray;
 use crate::config::{CommonConfig, ModuleOrientation, default};
 use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
-use crate::{lock, module_impl, spawn};
+use crate::{image, lock, module_impl, spawn};
 use color_eyre::{Report, Result};
 use gtk::prelude::*;
-use gtk::{IconTheme, Orientation};
+use gtk::{ContentFit, IconTheme, Orientation};
 use interface::TrayMenu;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -118,29 +118,47 @@ impl Module<gtk::Box> for TrayModule {
             .direction
             .map_or(info.bar_position.orientation(), Orientation::from);
 
+        let image_provider = context.ironbar.image_provider();
+
         // We use a `Box` here instead of the (supposedly correct) `MenuBar`
         // as the latter has issues on Sway with menus focus-stealing from the bar.
         let container = gtk::Box::new(orientation, 0);
 
         {
             let container = container.clone();
-            let mut menus = HashMap::new();
-            let activated_channel = context.controller_tx.clone();
 
             let provider = context.ironbar.image_provider();
             let icon_theme = provider.icon_theme();
 
             // listen for UI updates
             context.subscribe().recv_glib((), move |(), update| {
-                on_update(
-                    update,
-                    &container,
-                    &mut menus,
-                    &icon_theme,
-                    self.icon_size,
-                    self.prefer_theme_icons,
-                    &activated_channel,
-                );
+                let mut menus = HashMap::new();
+                let image_provider = image_provider.clone();
+                let icon_theme = icon_theme.clone();
+                // let container = container.clone();
+                let activated_channel = context.controller_tx.clone();
+                glib::spawn_future_local(async move {
+                    on_update(
+                        image_provider.clone(),
+                        update.clone(),
+                        &container,
+                        &mut menus,
+                        &icon_theme,
+                        self.icon_size.clone(),
+                        self.prefer_theme_icons.clone(),
+                        &activated_channel,).await;
+                });
+                // glib::Continue(true)
+                // on_update(
+                //     image_provider.clone(),
+                //     update,
+                //     &container,
+                //     &mut menus,
+                //     &icon_theme,
+                //     self.icon_size,
+                //     self.prefer_theme_icons,
+                //     &activated_channel,
+                // ).await;
             });
         };
 
@@ -153,7 +171,8 @@ impl Module<gtk::Box> for TrayModule {
 
 /// Handles UI updates as callback,
 /// getting the diff since the previous update and applying it to the menu.
-fn on_update(
+async fn on_update(
+    image_provider: image::Provider,
     update: Event,
     container: &gtk::Box,
     menus: &mut HashMap<Box<str>, TrayMenu>,
@@ -170,6 +189,36 @@ fn on_update(
 
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
+
+            let image_size = 128;
+            let album_image = gtk::Picture::builder()
+                .content_fit(ContentFit::ScaleDown)
+                .width_request(128)
+                .height_request(128)
+                .build();
+            // image_provider.load_into_picture(menu_item.icon_name, image_size, false, album_image);
+            //
+            let ee = menu_item.icon_name.clone().unwrap().to_string();
+            let dd = image_provider.load_into_picture(&ee, image_size, false, &album_image).await;
+            // let success = match image_provider
+            //     .load_into_picture(&menu_item.icon_name.unwrap().to_string(), image_size, false, &album_image)
+            //     .await
+            // {
+            //     // Ok(true) => {
+            //     //     // crate::modules::tray::icon::get_image_from_pixmap(album_image.icon_pixmap.as_deref(), image_size)
+            //     //     // album_image.set_visible(true);
+            //     //     // album_image.
+            //     //     true
+            //     // }
+            //     // Ok(false) => {
+            //     //     // warn!("failed to parse image: {}", menu_item.icon_name);
+            //     //     false
+            //     // }
+            //     // Err(err) => {
+            //     //     // error!("failed to load image: {}", err);
+            //     //     false
+            //     // }
+            // };
 
             if let Ok(image) = icon::get_image(&menu_item, icon_size, prefer_icons, icon_theme) {
                 menu_item.set_image(&image);
