@@ -5,13 +5,15 @@ use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
 use crate::clients::tray;
 use crate::config::{CommonConfig, ModuleOrientation, default};
 use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
-use crate::{image, lock, module_impl, spawn};
+use crate::{lock, module_impl, spawn};
 use color_eyre::{Report, Result};
 use gtk::prelude::*;
-use gtk::{ContentFit, IconTheme, Orientation};
+use gtk::{IconTheme, Orientation};
 use interface::TrayMenu;
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use system_tray::client::Event;
 use system_tray::client::{ActivateRequest, UpdateEvent};
 use tokio::sync::mpsc;
@@ -118,68 +120,57 @@ impl Module<gtk::Box> for TrayModule {
             .direction
             .map_or(info.bar_position.orientation(), Orientation::from);
 
-        let image_provider = context.ironbar.image_provider();
-
         // We use a `Box` here instead of the (supposedly correct) `MenuBar`
         // as the latter has issues on Sway with menus focus-stealing from the bar.
         let container = gtk::Box::new(orientation, 0);
 
-        {
-            let container = container.clone();
+        // Clone container for the closure — this is necessary because GTK widgets are not Copy
+        let container_for_closure = container.clone();
 
-            let provider = context.ironbar.image_provider();
-            let icon_theme = provider.icon_theme();
+        let menus = Rc::new(RefCell::new(HashMap::<Box<str>, TrayMenu>::new()));
+        let activated_channel = context.controller_tx.clone();
+        let provider = context.ironbar.image_provider();
+        let icon_theme = provider.icon_theme();
+        let icon_size = self.icon_size;
+        let prefer_icons = self.prefer_theme_icons;
 
-            // listen for UI updates
-            context.subscribe().recv_glib((), move |(), update| {
-                let mut menus = HashMap::new();
-                let image_provider = image_provider.clone();
-                let icon_theme = icon_theme.clone();
-                // let container = container.clone();
-                let activated_channel = context.controller_tx.clone();
-                glib::spawn_future_local(async move {
-                    on_update(
-                        image_provider.clone(),
-                        update.clone(),
-                        &container,
-                        &mut menus,
-                        &icon_theme,
-                        self.icon_size.clone(),
-                        self.prefer_theme_icons.clone(),
-                        &activated_channel,).await;
-                });
-                // glib::Continue(true)
-                // on_update(
-                //     image_provider.clone(),
-                //     update,
-                //     &container,
-                //     &mut menus,
-                //     &icon_theme,
-                //     self.icon_size,
-                //     self.prefer_theme_icons,
-                //     &activated_channel,
-                // ).await;
+        // listen for UI updates
+        context.subscribe().recv_glib((), move |(), update| {
+            let container = container_for_closure.clone();
+            let menus = menus.clone();
+            let icon_theme = icon_theme.clone();
+            let activated_channel = activated_channel.clone();
+
+            glib::spawn_future_local(async move {
+                on_update_async(
+                    update,
+                    container,
+                    menus,
+                    icon_theme,
+                    icon_size,
+                    prefer_icons,
+                    activated_channel,
+                )
+                    .await;
             });
-        };
+        });
 
         Ok(ModuleParts {
-            widget: container,
+            widget: container, // ← original container is still available
             popup: None,
         })
     }
 }
 
-/// Handles UI updates as callback,
-/// getting the diff since the previous update and applying it to the menu.
-async fn on_update(
-    image_provider: image::Provider,
+/// Handles UI updates asynchronously.
+async fn on_update_async(
     update: Event,
-    container: &gtk::Box,
-    menus: &mut HashMap<Box<str>, TrayMenu>,
-    icon_theme: &IconTheme,
+    container: gtk::Box,
+    menus: Rc<RefCell<HashMap<Box<str>, TrayMenu>>>,
+    icon_theme: IconTheme,
     icon_size: u32,
     prefer_icons: bool,
-    activated_channel: &mpsc::Sender<ActivateRequest>,
+    activated_channel: mpsc::Sender<ActivateRequest>,
 ) {
     match update {
         Event::Add(address, item) => {
@@ -190,50 +181,25 @@ async fn on_update(
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
 
-            let image_size = 128;
-            let album_image = gtk::Picture::builder()
-                .content_fit(ContentFit::ScaleDown)
-                .width_request(128)
-                .height_request(128)
-                .build();
-            // image_provider.load_into_picture(menu_item.icon_name, image_size, false, album_image);
-            //
-            let ee = menu_item.icon_name.clone().unwrap().to_string();
-            let dd = image_provider.load_into_picture(&ee, image_size, false, &album_image).await;
-            // let success = match image_provider
-            //     .load_into_picture(&menu_item.icon_name.unwrap().to_string(), image_size, false, &album_image)
-            //     .await
-            // {
-            //     // Ok(true) => {
-            //     //     // crate::modules::tray::icon::get_image_from_pixmap(album_image.icon_pixmap.as_deref(), image_size)
-            //     //     // album_image.set_visible(true);
-            //     //     // album_image.
-            //     //     true
-            //     // }
-            //     // Ok(false) => {
-            //     //     // warn!("failed to parse image: {}", menu_item.icon_name);
-            //     //     false
-            //     // }
-            //     // Err(err) => {
-            //     //     // error!("failed to load image: {}", err);
-            //     //     false
-            //     // }
-            // };
-
-            if let Ok(image) = icon::get_image(&menu_item, icon_size, prefer_icons, icon_theme) {
-                menu_item.set_image(&image);
-            } else {
-                let label = menu_item.title.clone().unwrap_or(address.clone());
-                menu_item.set_label(&label);
+            // If `get_image` is sync, just call it directly.
+            // If you later make it async (e.g., loading from disk), change to `get_image_async`.
+            match icon::get_image(&menu_item, icon_size, prefer_icons, &icon_theme) {
+                Ok(image) => menu_item.set_image(&image),
+                Err(e) => {
+                    error!("error loading icon: {e}");
+                    let label = menu_item.title.clone().unwrap_or(address.clone());
+                    menu_item.set_label(&label);
+                }
             }
 
-            menus.insert(address.into(), menu_item);
+            menus.borrow_mut().insert(address.into(), menu_item);
         }
         Event::Update(address, update) => {
             debug!("Received tray update for '{address}'");
-            trace!("Tray update for '{address}: {update:?}'");
+            trace!("Tray update for '{address}': {update:?}");
 
-            let Some(menu_item) = menus.get_mut(address.as_str()) else {
+            let mut menus_borrow = menus.borrow_mut();
+            let Some(menu_item) = menus_borrow.get_mut(address.as_str()) else {
                 error!("Attempted to update menu at '{address}' but could not find it");
                 return;
             };
@@ -250,7 +216,7 @@ async fn on_update(
 
                     if icon_name.as_ref() != menu_item.icon_name() {
                         menu_item.set_icon_name(icon_name);
-                        match icon::get_image(menu_item, icon_size, prefer_icons, icon_theme) {
+                        match icon::get_image(menu_item, icon_size, prefer_icons, &icon_theme) {
                             Ok(image) => menu_item.set_image(&image),
                             Err(e) => {
                                 error!("error loading icon: {e}");
@@ -287,8 +253,11 @@ async fn on_update(
         Event::Remove(address) => {
             debug!("Removing tray item at '{address}'");
 
-            if let Some(menu) = menus.get(address.as_str()) {
+            if let Some(menu) = menus.borrow().get(address.as_str()) {
                 container.remove(&menu.widget);
+                // Note: we don't remove from the map here, but it's fine —
+                // or you can remove it for cleanliness:
+                menus.borrow_mut().remove(address.as_str());
             }
         }
     }
