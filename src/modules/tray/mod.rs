@@ -187,31 +187,46 @@ async fn on_update_async(
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
 
+            // Try to load icon via async image provider if icon name is available
+            let icon_loaded = if let Some(icon_name) = menu_item.icon_name() {
+                let picture = gtk::Picture::builder()
+                    .content_fit(ContentFit::ScaleDown)
+                    .width_request(icon_size as i32)
+                    .height_request(icon_size as i32)
+                    .build();
 
-            let image_size = 128;
-            let album_image = gtk::Picture::builder()
-                .content_fit(ContentFit::ScaleDown)
-                .width_request(128)
-                .height_request(128)
-                .build();
+                match image_provider
+                    .load_into_picture(icon_name, icon_size as i32, false, &picture)
+                    .await
+                {
+                    Ok((_)) => {
+                        if let Some(paintable) = picture.paintable() {
+                            let image = Image::new();
+                            image.set_paintable(Some(&paintable));
+                            menu_item.set_image(&image);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to load icon '{}' via image provider: {}", icon_name, e);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
 
-            let ee = menu_item.icon_name.clone().unwrap().to_string();
-            let dd = image_provider.load_into_picture(&ee, image_size, false, &album_image).await;
-            let ff = album_image.paintable();
-
-            let image = Image::new();
-            image.set_paintable(ff.as_ref());
-            Ok(image) => {};
-            // let gg = crate::modules::tray::icon::get_image_from_pixmap(ff, image_size);
-
-        // If `get_image` is sync, just call it directly.
-            // If you later make it async (e.g., loading from disk), change to `get_image_async`.
-            match icon::get_image(&menu_item, icon_size, prefer_icons, &icon_theme) {
-                Ok(image) => menu_item.set_image(&image),
-                Err(e) => {
-                    error!("error loading icon: {e}");
-                    let label = menu_item.title.clone().unwrap_or(address.clone());
-                    menu_item.set_label(&label);
+            // Fallback to traditional icon loading if async method failed or no icon name
+            if !icon_loaded {
+                match icon::get_image(&menu_item, icon_size, prefer_icons, &icon_theme) {
+                    Ok(image) => menu_item.set_image(&image),
+                    Err(e) => {
+                        error!("error loading icon: {e}");
+                        let label = menu_item.title.clone().unwrap_or(address.clone());
+                        menu_item.set_label(&label);
+                    }
                 }
             }
 
@@ -239,11 +254,46 @@ async fn on_update_async(
 
                     if icon_name.as_ref() != menu_item.icon_name() {
                         menu_item.set_icon_name(icon_name);
-                        match icon::get_image(menu_item, icon_size, prefer_icons, &icon_theme) {
-                            Ok(image) => menu_item.set_image(&image),
-                            Err(e) => {
-                                error!("error loading icon: {e}");
-                                menu_item.show_label();
+
+                        // Try async image provider first
+                        let icon_loaded = if let Some(name) = menu_item.icon_name() {
+                            let picture = gtk::Picture::builder()
+                                .content_fit(ContentFit::ScaleDown)
+                                .width_request(icon_size as i32)
+                                .height_request(icon_size as i32)
+                                .build();
+
+                            match image_provider
+                                .load_into_picture(name, icon_size as i32, false, &picture)
+                                .await
+                            {
+                                Ok((_)) => {
+                                    if let Some(paintable) = picture.paintable() {
+                                        let image = Image::new();
+                                        image.set_paintable(Some(&paintable));
+                                        menu_item.set_image(&image);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to load icon '{}' via image provider: {}", name, e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        // Fallback if needed
+                        if !icon_loaded {
+                            match icon::get_image(menu_item, icon_size, prefer_icons, &icon_theme) {
+                                Ok(image) => menu_item.set_image(&image),
+                                Err(e) => {
+                                    error!("error loading icon: {e}");
+                                    menu_item.show_label();
+                                }
                             }
                         }
                     }
@@ -276,10 +326,13 @@ async fn on_update_async(
         Event::Remove(address) => {
             debug!("Removing tray item at '{address}'");
 
-            if let Some(menu) = menus.borrow().get(address.as_str()) {
-                container.remove(&menu.widget);
-                // Note: we don't remove from the map here, but it's fine —
-                // or you can remove it for cleanliness:
+            let widget = menus
+                .borrow()
+                .get(address.as_str())
+                .map(|menu| menu.widget.clone());
+
+            if let Some(widget) = widget {
+                container.remove(&widget);
                 menus.borrow_mut().remove(address.as_str());
             }
         }
