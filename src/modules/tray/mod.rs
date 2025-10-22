@@ -5,10 +5,10 @@ use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
 use crate::clients::tray;
 use crate::config::{CommonConfig, ModuleOrientation, default};
 use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
-use crate::{lock, module_impl, spawn};
+use crate::{image, lock, module_impl, spawn};
 use color_eyre::{Report, Result};
 use gtk::prelude::*;
-use gtk::{IconTheme, Orientation};
+use gtk::{ContentFit, IconTheme, Image, Orientation};
 use interface::TrayMenu;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -18,6 +18,7 @@ use system_tray::client::Event;
 use system_tray::client::{ActivateRequest, UpdateEvent};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
+use crate::image::Provider;
 
 #[derive(Debug, Deserialize, Clone)]
 #[cfg_attr(feature = "extras", derive(schemars::JsonSchema))]
@@ -120,6 +121,8 @@ impl Module<gtk::Box> for TrayModule {
             .direction
             .map_or(info.bar_position.orientation(), Orientation::from);
 
+        let image_provider = context.ironbar.image_provider();
+
         // We use a `Box` here instead of the (supposedly correct) `MenuBar`
         // as the latter has issues on Sway with menus focus-stealing from the bar.
         let container = gtk::Box::new(orientation, 0);
@@ -136,6 +139,7 @@ impl Module<gtk::Box> for TrayModule {
 
         // listen for UI updates
         context.subscribe().recv_glib((), move |(), update| {
+            let image_provider = image_provider.clone();
             let container = container_for_closure.clone();
             let menus = menus.clone();
             let icon_theme = icon_theme.clone();
@@ -143,6 +147,7 @@ impl Module<gtk::Box> for TrayModule {
 
             glib::spawn_future_local(async move {
                 on_update_async(
+                    image_provider,
                     update,
                     container,
                     menus,
@@ -164,6 +169,7 @@ impl Module<gtk::Box> for TrayModule {
 
 /// Handles UI updates asynchronously.
 async fn on_update_async(
+    image_provider: image::Provider,
     update: Event,
     container: gtk::Box,
     menus: Rc<RefCell<HashMap<Box<str>, TrayMenu>>>,
@@ -181,7 +187,24 @@ async fn on_update_async(
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
 
-            // If `get_image` is sync, just call it directly.
+
+            let image_size = 128;
+            let album_image = gtk::Picture::builder()
+                .content_fit(ContentFit::ScaleDown)
+                .width_request(128)
+                .height_request(128)
+                .build();
+
+            let ee = menu_item.icon_name.clone().unwrap().to_string();
+            let dd = image_provider.load_into_picture(&ee, image_size, false, &album_image).await;
+            let ff = album_image.paintable();
+
+            let image = Image::new();
+            image.set_paintable(ff.as_ref());
+            Ok(image) => {};
+            // let gg = crate::modules::tray::icon::get_image_from_pixmap(ff, image_size);
+
+        // If `get_image` is sync, just call it directly.
             // If you later make it async (e.g., loading from disk), change to `get_image_async`.
             match icon::get_image(&menu_item, icon_size, prefer_icons, &icon_theme) {
                 Ok(image) => menu_item.set_image(&image),
