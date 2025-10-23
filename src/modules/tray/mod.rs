@@ -5,13 +5,15 @@ use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
 use crate::clients::tray;
 use crate::config::{CommonConfig, ModuleOrientation, default};
 use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
-use crate::{lock, module_impl, spawn};
+use crate::{image, lock, module_impl, spawn};
 use color_eyre::{Report, Result};
 use gtk::prelude::*;
-use gtk::{IconTheme, Orientation};
+use gtk::{ContentFit, IconTheme, Orientation, Picture};
 use interface::TrayMenu;
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use system_tray::client::Event;
 use system_tray::client::{ActivateRequest, UpdateEvent};
 use tokio::sync::mpsc;
@@ -122,27 +124,39 @@ impl Module<gtk::Box> for TrayModule {
         // as the latter has issues on Sway with menus focus-stealing from the bar.
         let container = gtk::Box::new(orientation, 0);
 
-        {
-            let container = container.clone();
-            let mut menus = HashMap::new();
-            let activated_channel = context.controller_tx.clone();
+        let image_provider = context.ironbar.image_provider();
 
-            let provider = context.ironbar.image_provider();
-            let icon_theme = provider.icon_theme();
+        // Clone container for the closure — this is necessary because GTK widgets are not Copy
+        let container_for_closure = container.clone();
 
-            // listen for UI updates
-            context.subscribe().recv_glib((), move |(), update| {
+        let menus = Rc::new(RefCell::new(HashMap::<Box<str>, TrayMenu>::new()));
+        let activated_channel = context.controller_tx.clone();
+        let icon_theme = image_provider.icon_theme();
+        let icon_size = self.icon_size;
+        let prefer_icons = self.prefer_theme_icons;
+
+        // listen for UI updates
+        context.subscribe().recv_glib((), move |(), update| {
+            let image_provider = image_provider.clone();
+            let container = container_for_closure.clone();
+            let menus = menus.clone();
+            let icon_theme = icon_theme.clone();
+            let activated_channel = activated_channel.clone();
+
+            glib::spawn_future_local(async move {
                 on_update(
+                    image_provider,
                     update,
-                    &container,
-                    &mut menus,
-                    &icon_theme,
-                    self.icon_size,
-                    self.prefer_theme_icons,
-                    &activated_channel,
-                );
+                    container,
+                    menus,
+                    icon_theme,
+                    icon_size,
+                    prefer_icons,
+                    activated_channel,
+                )
+                    .await;
             });
-        };
+        });
 
         Ok(ModuleParts {
             widget: container,
@@ -153,14 +167,15 @@ impl Module<gtk::Box> for TrayModule {
 
 /// Handles UI updates as callback,
 /// getting the diff since the previous update and applying it to the menu.
-fn on_update(
+async fn on_update(
+    image_provider: image::Provider,
     update: Event,
-    container: &gtk::Box,
-    menus: &mut HashMap<Box<str>, TrayMenu>,
-    icon_theme: &IconTheme,
+    container: gtk::Box,
+    menus: Rc<RefCell<HashMap<Box<str>, TrayMenu>>>,
+    icon_theme: IconTheme,
     icon_size: u32,
     prefer_icons: bool,
-    activated_channel: &mpsc::Sender<ActivateRequest>,
+    activated_channel: mpsc::Sender<ActivateRequest>,
 ) {
     match update {
         Event::Add(address, item) => {
@@ -171,20 +186,58 @@ fn on_update(
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
 
-            if let Ok(image) = icon::get_image(&menu_item, icon_size, prefer_icons, icon_theme) {
-                menu_item.set_image(&image);
+            // Try to load icon via async image provider if icon name is available
+            let icon_loaded = if let Some(icon_name) = menu_item.icon_name() {
+                let picture = Picture::builder()
+                    .content_fit(ContentFit::ScaleDown)
+                    .width_request(icon_size as i32)
+                    .height_request(icon_size as i32)
+                    .build();
+
+                match image_provider
+                    .load_into_picture(icon_name, icon_size as i32, false, &picture)
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(paintable) = picture.paintable() {
+                            let picture = Picture::new();
+                            picture.set_content_fit(ContentFit::ScaleDown);
+                            picture.set_paintable(Some(&paintable));
+                            menu_item.set_image(&picture);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to load icon '{}' via image provider: {}", icon_name, e);
+                        false
+                    }
+                }
             } else {
-                let label = menu_item.title.clone().unwrap_or(address.clone());
-                menu_item.set_label(&label);
+                false
+            };
+
+            // Fallback to traditional icon loading if async method failed or no icon name
+            if !icon_loaded {
+                match icon::get_image(&menu_item, icon_size, prefer_icons, &icon_theme) {
+                    Ok(image) => menu_item.set_image(&image),
+                    Err(e) => {
+                        error!("error loading icon: {e}");
+                        let label = menu_item.title.clone().unwrap_or(address.clone());
+                        menu_item.set_label(&label);
+                    }
+                }
             }
 
-            menus.insert(address.into(), menu_item);
+            menus.borrow_mut().insert(address.into(), menu_item);
         }
         Event::Update(address, update) => {
             debug!("Received tray update for '{address}'");
             trace!("Tray update for '{address}: {update:?}'");
 
-            let Some(menu_item) = menus.get_mut(address.as_str()) else {
+            let mut menus_borrow = menus.borrow_mut();
+            let Some(menu_item) = menus_borrow.get_mut(address.as_str()) else {
                 error!("Attempted to update menu at '{address}' but could not find it");
                 return;
             };
@@ -201,11 +254,40 @@ fn on_update(
 
                     if icon_name.as_ref() != menu_item.icon_name() {
                         menu_item.set_icon_name(icon_name);
-                        match icon::get_image(menu_item, icon_size, prefer_icons, icon_theme) {
-                            Ok(image) => menu_item.set_image(&image),
-                            Err(e) => {
-                                error!("error loading icon: {e}");
-                                menu_item.show_label();
+
+                        // Try async image provider first
+                        let icon_loaded = if let Some(name) = menu_item.icon_name() {
+                            let picture = Picture::builder()
+                                .content_fit(ContentFit::ScaleDown)
+                                .width_request(icon_size as i32)
+                                .height_request(icon_size as i32)
+                                .build();
+
+                            match image_provider
+                                .load_into_picture(name, icon_size as i32, false, &picture)
+                                .await
+                            {
+                                Ok(_) => {
+                                    menu_item.set_image(&picture);
+                                    true
+                                }
+                                Err(e) => {
+                                    error!("Failed to load icon '{}' via image provider: {}", name, e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        // Fallback if needed
+                        if !icon_loaded {
+                            match icon::get_image(menu_item, icon_size, prefer_icons, &icon_theme) {
+                                Ok(image) => menu_item.set_image(&image),
+                                Err(e) => {
+                                    error!("error loading icon: {e}");
+                                    menu_item.show_label();
+                                }
                             }
                         }
                     }
@@ -238,8 +320,14 @@ fn on_update(
         Event::Remove(address) => {
             debug!("Removing tray item at '{address}'");
 
-            if let Some(menu) = menus.get(address.as_str()) {
-                container.remove(&menu.widget);
+            let widget = menus
+                .borrow()
+                .get(address.as_str())
+                .map(|menu| menu.widget.clone());
+
+            if let Some(widget) = widget {
+                container.remove(&widget);
+                menus.borrow_mut().remove(address.as_str());
             }
         }
     }
