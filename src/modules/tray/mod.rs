@@ -5,10 +5,10 @@ use crate::channels::{AsyncSenderExt, BroadcastReceiverExt};
 use crate::clients::tray;
 use crate::config::{CommonConfig, ModuleOrientation, default};
 use crate::modules::{Module, ModuleInfo, ModuleParts, WidgetContext};
-use crate::{lock, module_impl, spawn};
+use crate::{image, lock, module_impl, spawn};
 use color_eyre::{Report, Result};
 use gtk::prelude::*;
-use gtk::{IconTheme, Orientation};
+use gtk::{ContentFit, IconTheme, Orientation, Picture};
 use interface::TrayMenu;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -114,6 +114,7 @@ impl Module<gtk::Box> for TrayModule {
         context: WidgetContext<Self::SendMessage, Self::ReceiveMessage>,
         info: &ModuleInfo,
     ) -> Result<ModuleParts<gtk::Box>> {
+        let image_provider = context.ironbar.image_provider();
         let orientation = self
             .direction
             .map_or(info.bar_position.orientation(), Orientation::from);
@@ -133,6 +134,7 @@ impl Module<gtk::Box> for TrayModule {
             // listen for UI updates
             context.subscribe().recv_glib((), move |(), update| {
                 on_update(
+                    image_provider.clone(),
                     update,
                     &container,
                     &mut menus,
@@ -154,6 +156,7 @@ impl Module<gtk::Box> for TrayModule {
 /// Handles UI updates as callback,
 /// getting the diff since the previous update and applying it to the menu.
 fn on_update(
+    image_provider: image::Provider,
     update: Event,
     container: &gtk::Box,
     menus: &mut HashMap<Box<str>, TrayMenu>,
@@ -171,11 +174,34 @@ fn on_update(
             let x: Option<&gtk::Widget> = None;
             container.insert_child_after(&menu_item.widget, x);
 
-            if let Ok(image) = icon::get_image(&menu_item, icon_size, prefer_icons, icon_theme) {
-                menu_item.set_image(&image);
+            let image_provider = image_provider.clone();
+
+            let gtk_image = Picture::builder()
+                .content_fit(ContentFit::ScaleDown)
+                .build();
+            menu_item.set_image(&gtk_image);
+
+            let icon_loaded = if let Some(icon_name) = menu_item.icon_name() {
+                let icon_name = icon_name.clone();
+
+                glib::spawn_future_local(async move {
+                    image_provider
+                        .load_into_picture_silent(&icon_name, icon_size as i32, true, &gtk_image)
+                        .await;
+                });
+
+                true
             } else {
-                let label = menu_item.title.clone().unwrap_or(address.clone());
-                menu_item.set_label(&label);
+                false
+            };
+
+            if !icon_loaded {
+                if let Ok(image) = icon::get_image(&menu_item, icon_size, prefer_icons, icon_theme) {
+                    menu_item.set_image(&image);
+                } else {
+                    let label = menu_item.title.clone().unwrap_or(address.clone());
+                    menu_item.set_label(&label);
+                }
             }
 
             menus.insert(address.into(), menu_item);
